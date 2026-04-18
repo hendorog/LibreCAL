@@ -5,14 +5,22 @@ Converts LibreCAL Touchstone files to a format that a Siglent VNA can use.
 
 Usage:
 
-$ python3 convert_siglent.py /Volumes/LIBRECAL_R /Volumes/LIBRECAL_RW
+$ python3 convert_siglent.py [--ports 2|4] /Volumes/LIBRECAL_R /Volumes/LIBRECAL_RW
 
 (or your paths or drive letters, as appropriate)
 
-This will create a "siglent" directory in your LIBRECAL_RW volume.  Then,
-plug in your LibreCAL while holding down the FUNCTION button, which will
-activate Siglent eCal compatibility mode, and calibrate your VNA as if you
-were using a SEM5000A (or other Siglent eCal).
+This will create a "siglent" directory in your LIBRECAL_RW volume.  Once
+the files are present the LibreCAL firmware enters Siglent emulation
+automatically when it is next powered on (hold the FUNCTION button at
+power-on to force it back into the default LibreCAL mode).  The instrument
+will then calibrate your VNA as if you were using a SEM5032A (2-port,
+default) or SEM5004A (4-port).
+
+By default the script emits the 2-port SEM5032A layout.  This matches a
+genuine SEM5032A memory dump exactly (CSV columns, info.dat header bytes,
+keyword names and padding) and is the layout that has been observed to work
+reliably on SNA5000A series instruments.  Use --ports 4 to get the original
+4-port layout.
 
 Tested on SVA1032X and SNA5000A.
 """
@@ -21,26 +29,66 @@ __author__ = "Joshua Wise"
 __copyright__ = "Copyright (c) 2025 Accelerated Tech, Inc."
 __license__ = "MIT"
 
+import argparse
 import io
+from itertools import combinations
 from pathlib import Path
 import sys
 import numpy as np
 from zipfile import ZipFile, ZIP_DEFLATED
-import zipfile
 import struct
 import hashlib
 from time import strftime, gmtime
 
-if len(sys.argv) != 3:
-    print(f"usage: {sys.argv[0]} /Volumes/LIBRECAL_R /Volumes/LIBRECAL_RW")
-    sys.exit(1)
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("indir", type=Path, help="read-only LibreCAL volume")
+parser.add_argument("outdir", type=Path, help="read/write LibreCAL volume")
+parser.add_argument("--ports", type=int, default=2, choices=(2, 4),
+                    help="number of ports to emulate (default 2 -> SEM5032A)")
+args = parser.parse_args()
 
-indir = Path(sys.argv[1])
-outdir = Path(sys.argv[2])
+indir = args.indir
+outdir = args.outdir
+NPORTS = args.ports
 
-def say_open(name, *args):
+PORT_NUMS = list(range(1, NPORTS + 1))
+PORT_LETTERS = [chr(ord('A') + i) for i in range(NPORTS)]
+PAIRS = list(combinations(range(NPORTS), 2))  # index pairs into PORT_NUMS/PORT_LETTERS
+
+
+def say_open(name, *a):
     print(f"reading {name}", file=sys.stderr)
-    return open(name, *args)
+    return open(name, *a)
+
+
+def read_s1p(path):
+    freqs, re, im = [], [], []
+    with say_open(path, "r") as f:
+        for l in f:
+            l = l.strip()
+            if not l or l.startswith("!") or l.startswith("#"):
+                continue
+            freq, r, i = [float(x) for x in l.split()]
+            freqs.append(freq * 1e9)
+            re.append(r)
+            im.append(i)
+    return freqs, re, im
+
+
+def read_s2p(path):
+    freqs = []
+    cols = [[] for _ in range(8)]  # s11r,s11i,s21r,s21i,s12r,s12i,s22r,s22i
+    with say_open(path, "r") as f:
+        for l in f:
+            l = l.strip()
+            if not l or l.startswith("!") or l.startswith("#"):
+                continue
+            parts = [float(x) for x in l.split()]
+            freqs.append(parts[0] * 1e9)
+            for k in range(8):
+                cols[k].append(parts[1 + k])
+    return freqs, cols
+
 
 zipbuf = io.BytesIO()
 with ZipFile(zipbuf, "w", compression=ZIP_DEFLATED, compresslevel=9) as zf, \
@@ -49,51 +97,67 @@ with ZipFile(zipbuf, "w", compression=ZIP_DEFLATED, compresslevel=9) as zf, \
     with say_open(indir / "info.txt", "r") as inf:
         for l in inf.readlines():
             outf.write(f"! {l.strip()}\n")
-    outf.write("#HZ,A,B,C,D,T_AB,T_AC,T_AD,T_BC,T_BD,T_CD,CF_AB,CF_AC,CF_AD,CF_BC,CF_BD,CF_CD\n")
 
-    freqs = [] # will get populated below
+    # Header: matches the genuine Siglent Factory.csv layout.
+    #   #freq, <A,B,[C,D]>, <T_xy for every pair>, <CF_xy for every pair>, END
+    # Each port column group holds 4 one-port standards (OPEN, SHORT, LOAD,
+    # ATT) x 2 (re,im) = 8 numbers.  Each T_/CF_ column group holds a 2-port
+    # s-parameter set (s11, s21, s12, s22) x 2 = 8 numbers.
+    pair_labels = [PORT_LETTERS[i] + PORT_LETTERS[j] for (i, j) in PAIRS]
+    header_cols = (["#freq"] + PORT_LETTERS
+                   + [f"T_{p}" for p in pair_labels]
+                   + [f"CF_{p}" for p in pair_labels]
+                   + ["END"])
+    outf.write(",".join(header_cols) + "\n")
+
+    freqs = []
     axes = [freqs]
 
-    for port in ["1", "2", "3", "4"]:
-        for col in "OPEN", "SHORT", "LOAD":
-            with say_open(indir / f"P{port}_{col}.s1p", "r") as inf:
-                ax_r, ax_i = [], []
-                for l in inf.readlines():
-                    l = l.strip()
-                    if l.startswith("!") or l.startswith("#"):
-                        continue
-                    freq,r,i = [float(x) for x in l.split(" ")]
-                    freqs.append(freq * 1e9)
-                    ax_r.append(r)
-                    ax_i.append(i)
-                axes.append(ax_r)
-                axes.append(ax_i)
-                freqs = [] # hope they're all the same!
-        axes.append([0 for _ in axes[0]])
-        axes.append([0 for _ in axes[0]])
+    # Per-port one-port standards.
+    # LibreCAL does not have a physical ATT standard; the firmware does not
+    # switch state when asked for per-port ATT, so the physical state during
+    # an ATT request is whatever was last selected (typically LOAD).  Storing
+    # LOAD values in the ATT slot therefore keeps the stored and measured
+    # values consistent.
+    for port in PORT_NUMS:
+        load_re, load_im = None, None
+        for std in ("OPEN", "SHORT", "LOAD"):
+            fr, re_, im_ = read_s1p(indir / f"P{port}_{std}.s1p")
+            if not freqs:
+                freqs[:] = fr
+            axes.append(re_)
+            axes.append(im_)
+            if std == "LOAD":
+                load_re, load_im = re_, im_
+        # ATT slot = LOAD data (LibreCAL has no real attenuator).
+        axes.append(list(load_re))
+        axes.append(list(load_im))
 
-    # We don't have an actual confidence check thru standard on LibreCAL, so
-    # we use the THROUGH standard for that.
-    for port in ["12", "13", "14", "23", "24", "34"] * 2:
-        with say_open(indir / f"P{port}_THROUGH.s2p", "r") as inf:
-            snps = [ [] for _ in range(8) ]
-            for l in inf.readlines():
-                if l.startswith("!") or l.startswith("#"):
-                    continue
-                snp_line = [float(x) for x in l.split(" ")][1:]
-                for k,v in enumerate([float(x) for x in l.split(" ")][1:]):
-                    snps[k].append(v)
-            for l in snps:
-                axes.append(l)
+    # THROUGH s-parameters for every port pair.
+    through_cache = {}
+    for i, j in PAIRS:
+        pnum = f"{PORT_NUMS[i]}{PORT_NUMS[j]}"
+        fr, cols = read_s2p(indir / f"P{pnum}_THROUGH.s2p")
+        through_cache[(i, j)] = cols
+        for a in cols:
+            axes.append(a)
+
+    # CF (confidence-check) s-parameters.  LibreCAL has no separate
+    # confidence-check standard.  The firmware redirects "SL ATT,n,m" to the
+    # THRU switch state, so the physical hardware presents the THROUGH
+    # response in the CF state.  We therefore store the THROUGH data again
+    # in the CF slot to keep stored and measured values consistent.
+    for i, j in PAIRS:
+        for a in through_cache[(i, j)]:
+            axes.append(a)
+
+    axes[0] = freqs
 
     # Some early LibreCALs have a truncated P34_THROUGH.s2p file.  The
-    # Siglent format only supports identical number of points for all
-    # standards.  Keep track of shortest parameter list and truncate all
-    # parameters to that value.
-    shortest_axis = min(len(ax) for ax in axes)
-
-    for i in range(len(axes)):
-        axes[i] = axes[i][:shortest_axis]
+    # Siglent format requires the same number of points for every column,
+    # so truncate all columns to the shortest one.
+    shortest = min(len(a) for a in axes)
+    axes = [a[:shortest] for a in axes]
 
     ar = np.vstack(axes, dtype=np.float64).transpose()
     print(f"compressing {ar.shape[0]} points with {ar.shape[1]} columns")
@@ -102,30 +166,49 @@ with ZipFile(zipbuf, "w", compression=ZIP_DEFLATED, compresslevel=9) as zf, \
 ziphash = hashlib.md5(zipbuf.getvalue()).hexdigest()
 
 caldate = gmtime((indir / "P1_OPEN.s1p").stat().st_ctime)
-info = { k: v for k,v in (line.split(": ") for line in open(indir / "info.txt", "r").read().split("\n")) }
+info = {k: v for k, v in (line.split(": ", 1)
+                          for line in open(indir / "info.txt", "r").read().split("\n")
+                          if ": " in line)}
 
-VENDOR = "LibreVNA"
-PRODUCT = "LibreCAL"
-SERIAL = info['Serial']
-BYTE_0x4E = 4 # Not sure but best guess is that these bytes represent the number of ports on the eCal
-BYTE_0x4F = 0
-header = struct.pack("30s16s16s16sBB64s", b"", VENDOR.encode(), PRODUCT.encode(), SERIAL.encode(), BYTE_0x4E, BYTE_0x4F, b"")
+# --- info.dat header ---
+# Binary layout (first 128 bytes), copied from a genuine SEM5032A dump:
+#   [ 0:30]  vendor / manufacturer name (NUL-padded)
+#   [30:46]  module family (NUL-padded)
+#   [46:62]  model / product (NUL-padded)
+#   [62:78]  serial number (NUL-padded)
+#   [78]     number of ports
+#   [79]     0
+#   [80:128] 48 zero bytes
+# Then an ASCII section beginning with '\n' and containing Connector:,
+# Module:, Freq:, Data: and Date: lines.  The record is padded to 1024 bytes
+# with '#' characters (0x23), matching the genuine dump.
+VENDOR = "Siglent Technologies"
+MODEL = "SEM5032A" if NPORTS == 2 else "SEM5004A"
+PRODUCT = MODEL
+SERIAL = info["Serial"]
 
-header += f"""Connector:SMA
-Module:Factory
-Desc:{ziphash}
-Frequency:{int(axes[0][0])},{int(axes[0][-1])},{len(axes[0])}
-Data:0,{len(zipbuf.getvalue())},{ziphash}
-Date:{strftime('%Y-%m-%d', caldate)}
-""".encode()
+header = struct.pack(
+    "30s16s16s16sBB48s",
+    VENDOR.encode(), MODEL.encode(), PRODUCT.encode(), SERIAL.encode(),
+    NPORTS, 0, b"",
+)
 
-# There can also be a "Extension: a,b,c,d" (what is that?) after Module:,
-# and there can also be other Modules; we don't handle these for now. 
-# Connector: must always come before Module:.
+connector_field = " ".join(["SMA"] * NPORTS)
+text = (
+    f"\nConnector:{connector_field}"
+    f"\nModule:Factory"
+    f"\nFreq:{int(axes[0][0])},{int(axes[0][-1])},{len(axes[0])}"
+    f"\nData:0,{len(zipbuf.getvalue())},{ziphash}"
+    f"\nDate:{strftime('%d/%b/%Y', caldate)}"
+    f"\n"
+)
+header += text.encode()
 
-header += b"\x00" * (1024 - len(header))
+# Pad to 1024 bytes with '#' to match the genuine device image.  The last
+# byte is a '\n', also matching the genuine dump.
+header += b"#" * (1024 - len(header) - 1) + b"\n"
 
-(outdir / "siglent").mkdir(exist_ok = True)
+(outdir / "siglent").mkdir(exist_ok=True)
 
 zipname = outdir / "siglent/data0.zip"
 print(f"writing {zipname} ({len(zipbuf.getvalue())} bytes)", file=sys.stderr)
