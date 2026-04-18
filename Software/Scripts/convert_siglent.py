@@ -45,6 +45,11 @@ parser.add_argument("indir", type=Path, help="read-only LibreCAL volume")
 parser.add_argument("outdir", type=Path, help="read/write LibreCAL volume")
 parser.add_argument("--ports", type=int, default=2, choices=(2, 4),
                     help="number of ports to emulate (default 2 -> SEM5032A)")
+parser.add_argument("--modules", type=int, default=1,
+                    help="number of module entries (and data<N>.zip files) to "
+                         "emit (default 1).  Genuine Siglent eCals expose "
+                         "multiple selectable modules in the VNA GUI; all "
+                         "modules we emit carry identical LibreCAL data.")
 args = parser.parse_args()
 
 indir = args.indir
@@ -194,14 +199,20 @@ header = struct.pack(
 )
 
 connector_field = " ".join(["SMA"] * NPORTS)
-text = (
-    f"\nConnector:{connector_field}"
-    f"\nModule:Factory"
-    f"\nFreq:{int(axes[0][0])},{int(axes[0][-1])},{len(axes[0])}"
-    f"\nData:0,{len(zipbuf.getvalue())},{ziphash}"
-    f"\nDate:{strftime('%d/%b/%Y', caldate)}"
-    f"\n"
-)
+text = f"\nConnector:{connector_field}"
+# Emit one Module/Freq/Data/Date block per requested module.  The first
+# module is labelled "Factory" (matching a genuine eCal) and subsequent
+# ones are "Factory2", "Factory3", ...  The first field of each Data: line
+# is the index N, which the firmware uses to open siglent/data<N>.zip.
+for n in range(args.modules):
+    name = "Factory" if n == 0 else f"Factory{n + 1}"
+    text += (
+        f"\nModule:{name}"
+        f"\nFreq:{int(axes[0][0])},{int(axes[0][-1])},{len(axes[0])}"
+        f"\nData:{n},{len(zipbuf.getvalue())},{ziphash}"
+        f"\nDate:{strftime('%d/%b/%Y', caldate)}"
+    )
+text += "\n"
 header += text.encode()
 
 # Pad to 1024 bytes with '#' to match the genuine device image.  The last
@@ -210,10 +221,11 @@ header += b"#" * (1024 - len(header) - 1) + b"\n"
 
 (outdir / "siglent").mkdir(exist_ok=True)
 
-zipname = outdir / "siglent/data0.zip"
-print(f"writing {zipname} ({len(zipbuf.getvalue())} bytes)", file=sys.stderr)
-with open(zipname, "wb") as f:
-    f.write(zipbuf.getvalue())
+for n in range(args.modules):
+    zipname = outdir / f"siglent/data{n}.zip"
+    print(f"writing {zipname} ({len(zipbuf.getvalue())} bytes)", file=sys.stderr)
+    with open(zipname, "wb") as f:
+        f.write(zipbuf.getvalue())
 
 datname = outdir / "siglent/info.dat"
 print(f"writing {datname}", file=sys.stderr)
