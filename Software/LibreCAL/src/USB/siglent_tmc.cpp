@@ -120,11 +120,24 @@ extern "C" bool tud_usbtmc_msg_data_cb(void *data, size_t len, bool transfer_com
      * for this application it's ok to block the USB thread for the small
      * reads.
      */
+    if (fl_file_open) {
+      f_close(&fl_file);
+      fl_file_open = false;
+    }
     fl_file_open = f_open(&fl_file, "0:siglent/info.dat", FA_OPEN_EXISTING | FA_READ) == FR_OK;
+  } else if (!strcasecmp((char *)ibuf, "FL:DATA:READ:END\n")) {
+    if (fl_file_open) {
+      f_close(&fl_file);
+      fl_file_open = false;
+    }
   } else if (!strncasecmp((char *)ibuf, "FL:DATA:INDEX ", 14)) {
     int idx = atoi((char *)ibuf + 14);
     char name[32];
     snprintf(name, sizeof(name), "0:siglent/data%d.zip", idx);
+    if (fl_file_open) {
+      f_close(&fl_file);
+      fl_file_open = false;
+    }
     fl_file_open = f_open(&fl_file, name, FA_OPEN_EXISTING | FA_READ) == FR_OK;
   } else if (!strncasecmp((char *)ibuf, "FL:DATA:READ? ", 14)) {
     size_t req = atoi((char *)ibuf + 14);
